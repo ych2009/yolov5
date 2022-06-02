@@ -111,62 +111,115 @@ def export_torchscript(model, im, file, optimize, prefix=colorstr('TorchScript:'
 
 def export_onnx(model, im, file, opset, train, dynamic, simplify, prefix=colorstr('ONNX:')):
     # YOLOv5 ONNX export
-    try:
-        check_requirements(('onnx',))
-        import onnx
+    # try:
+    check_requirements(('onnx',))
+    import onnx
 
-        LOGGER.info(f'\n{prefix} starting export with onnx {onnx.__version__}...')
-        f = file.with_suffix('.onnx')
+    LOGGER.info(f'\n{prefix} starting export with onnx {onnx.__version__}...')
+    f = file.with_suffix('.onnx')
+    print(train)
+    torch.onnx.export(
+        model,
+        im,
+        f,
+        verbose=False,
+        opset_version=opset,
+        training=torch.onnx.TrainingMode.TRAINING if train else torch.onnx.TrainingMode.EVAL,
+        do_constant_folding=not train,
+        input_names=['images'],
+        output_names=['p3', 'p4', 'p5'],
+        dynamic_axes={
+            'images': {
+                0: 'batch',
+                2: 'height',
+                3: 'width'},  # shape(1,3,640,640)
+            'p3': {
+                0: 'batch',
+                2: 'height',
+                3: 'width'},  # shape(1,25200,4)
+            'p4': {
+                0: 'batch',
+                2: 'height',
+                3: 'width'},
+            'p5': {
+                0: 'batch',
+                2: 'height',
+                3: 'width'}
+        } if dynamic else None)
 
-        torch.onnx.export(
-            model,
-            im,
-            f,
-            verbose=False,
-            opset_version=opset,
-            training=torch.onnx.TrainingMode.TRAINING if train else torch.onnx.TrainingMode.EVAL,
-            do_constant_folding=not train,
-            input_names=['images'],
-            output_names=['output'],
-            dynamic_axes={
-                'images': {
-                    0: 'batch',
-                    2: 'height',
-                    3: 'width'},  # shape(1,3,640,640)
-                'output': {
-                    0: 'batch',
-                    1: 'anchors'}  # shape(1,25200,85)
-            } if dynamic else None)
+    # Checks
+    model_onnx = onnx.load(f)  # load onnx model
+    onnx.checker.check_model(model_onnx)  # check onnx model
+    
+    # Simplify
+    if simplify:
+        # try:
+        check_requirements(('onnx-simplifier',))
+        import onnxsim
 
-        # Checks
-        model_onnx = onnx.load(f)  # load onnx model
-        onnx.checker.check_model(model_onnx)  # check onnx model
-
-        # Metadata
-        d = {'stride': int(max(model.stride)), 'names': model.names}
-        for k, v in d.items():
-            meta = model_onnx.metadata_props.add()
-            meta.key, meta.value = k, str(v)
+        LOGGER.info(f'{prefix} simplifying with onnx-simplifier {onnxsim.__version__}...')
+        model_onnx, check = onnxsim.simplify(model_onnx,
+                                                dynamic_input_shape=dynamic,
+                                                input_shapes={'images': list(im.shape)} if dynamic else None)
+        assert check, 'assert check failed'
         onnx.save(model_onnx, f)
+        # except Exception as e:
+        #     LOGGER.info(f'{prefix} simplifier failure: {e}')
 
-        # Simplify
-        if simplify:
-            try:
-                check_requirements(('onnx-simplifier',))
-                import onnxsim
+    # add yolov5_decoding:
+    import onnx_graphsurgeon as onnx_gs
+    import numpy as np
+    yolo_graph = onnx_gs.import_onnx(model_onnx)
+    p3 = yolo_graph.outputs[0]
+    p4 = yolo_graph.outputs[1]
+    p5 = yolo_graph.outputs[2]
+    decode_out_0 = onnx_gs.Variable(
+        "DecodeNumDetection",
+        dtype=np.int32
+    )
+    decode_out_1 = onnx_gs.Variable(
+        "DecodeDetectionBoxes",
+        dtype=np.float32
+    )
+    decode_out_2 = onnx_gs.Variable(
+        "DecodeDetectionScores",
+        dtype=np.float32
+    )
+    decode_out_3 = onnx_gs.Variable(
+        "DecodeDetectionClasses",
+        dtype=np.int32
+    )
 
-                LOGGER.info(f'{prefix} simplifying with onnx-simplifier {onnxsim.__version__}...')
-                model_onnx, check = onnxsim.simplify(model_onnx,
-                                                     dynamic_input_shape=dynamic,
-                                                     input_shapes={'images': list(im.shape)} if dynamic else None)
-                assert check, 'assert check failed'
-                onnx.save(model_onnx, f)
-            except Exception as e:
-                LOGGER.info(f'{prefix} simplifier failure: {e}')
-        LOGGER.info(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
-        return f
-    except Exception as e:
-        LOGGER.info(f'{prefix} export failure: {e}')
+    decode_attrs = dict()
+
+    decode_attrs["max_stride"] = int(max(model.stride))
+    decode_attrs["num_classes"] = model.model[-1].nc
+    decode_attrs["anchors"] = [float(v) for v in [10,13, 16,30, 33,23, 30,61, 62,45, 59,119, 116,90, 156,198, 373,326]]
+    decode_attrs["prenms_score_threshold"] = 0.25
+
+    decode_plugin = onnx_gs.Node(
+        op="YoloLayer_TRT",
+        name="YoloLayer",
+        inputs=[p3, p4, p5],
+        outputs=[decode_out_0, decode_out_1, decode_out_2, decode_out_3],
+        attrs=decode_attrs
+    )
+
+    yolo_graph.nodes.append(decode_plugin)
+    yolo_graph.outputs = decode_plugin.outputs
+    yolo_graph.cleanup().toposort()
+    model_onnx = onnx_gs.export_onnx(yolo_graph)
+
+    d = {'stride': int(max(model.stride)), 'names': model.names}
+    for k, v in d.items():
+        meta = model_onnx.metadata_props.add()
+        meta.key, meta.value = k, str(v)
+
+    onnx.save(model_onnx, f)
+    LOGGER.info(f'{prefix} export success, saved as {f} ({file_size(f):.1f} MB)')
+    return f
+    # except Exception as e:
+    #     LOGGER.info(f'{prefix} export failure: {e}')
 
 
 def export_openvino(model, file, half, prefix=colorstr('OpenVINO:')):
@@ -488,7 +541,7 @@ def run(
         assert not dynamic, '--half not compatible with --dynamic, i.e. use either --half or --dynamic but not both'
     model = attempt_load(weights, device=device, inplace=True, fuse=True)  # load FP32 model
     nc, names = model.nc, model.names  # number of classes, class names
-
+    
     # Checks
     imgsz *= 2 if len(imgsz) == 1 else 1  # expand
     assert nc == len(names), f'Model class count {nc} != len(names) {len(names)}'
@@ -499,6 +552,7 @@ def run(
     im = torch.zeros(batch_size, 3, *imgsz).to(device)  # image size(1,3,320,192) BCHW iDetection
 
     # Update model
+    import torch.nn as nn
     if half and not coreml and not xml:
         im, model = im.half(), model.half()  # to FP16
     model.train() if train else model.eval()  # training mode = no Detect() layer grid construction
@@ -507,7 +561,9 @@ def run(
             m.inplace = inplace
             m.onnx_dynamic = dynamic
             m.export = True
-
+        elif isinstance(m, nn.Upsample):
+            print(m)
+    
     for _ in range(2):
         y = model(im)  # dry runs
     shape = tuple(y[0].shape)  # model output shape
